@@ -1,0 +1,25 @@
+name: update-fx-h1
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # allow the workflow to commit CSV updates
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas
+      - run: python scripts/fetch_fx_h1.py
+      - name: Commit & push CSVs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "update: FX H1 feed"
+          file_pattern: data/*.csv
