@@ -1,121 +1,75 @@
 # scripts/fetch_fx_h1.py
-# Pobiera H1 OHLC dla głównych par FX z AlphaVantage i zapisuje do data/*.csv
+# H1 OHLC z Yahoo Finance dla: BTCUSD, XAUUSD (GOLD), EURUSD, GBPUSD, USDJPY
+# Zapis do data/<SYMBOL>.csv, deduplikacja po timestamp. Bez kluczy API.
 
-import os
-import sys
-import time
-import json
-import requests
+import os, time, sys
 import pandas as pd
+import yfinance as yf
 
-API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
-if not API_KEY:
-    print("ERROR: Missing ALPHAVANTAGE_API_KEY (repo Settings → Secrets → Actions).", file=sys.stderr)
-    sys.exit(1)
+PAIRS = {
+    "BTCUSD": "BTC-USD",     # Bitcoin (USD)
+    "XAUUSD": "XAUUSD=X",    # Złoto spot (Gold vs USD)
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+}
 
-# Lista par do pobrania
-PAIRS = [
-    {"base": "EUR", "quote": "USD", "symbol": "EURUSD"},
-    {"base": "GBP", "quote": "USD", "symbol": "GBPUSD"},
-    {"base": "USD", "quote": "JPY", "symbol": "USDJPY"},
-    {"base": "USD", "quote": "CHF", "symbol": "USDCHF"},
-    {"base": "USD", "quote": "CAD", "symbol": "USDCAD"},
-    {"base": "AUD", "quote": "USD", "symbol": "AUDUSD"},
-    {"base": "NZD", "quote": "USD", "symbol": "NZDUSD"},
-]
+INTERVAL = "60m"                           # H1
+PERIOD = os.environ.get("YF_PERIOD", "90d")# zakres historii (np. 60–120d)
+OUTDIR = "data"
+PAUSE_S = 2                                # krótka pauza między zapytaniami
 
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTDIR, exist_ok=True)
 
-WAIT_BETWEEN_CALLS = 20  # AlphaVantage free: ok. 5 zapytań/min → 20s przerwy
-
-def fetch_pair(base: str, quote: str, symbol: str) -> bool:
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
-        "&interval=60min&outputsize=compact&datatype=json"
-        f"&apikey={API_KEY}"
-    )
-
-    try:
-        r = requests.get(url, timeout=30)
-    except Exception as e:
-        print(f"[ERR] {symbol}: request error: {e}")
-        return False
-
-    if r.status_code != 200:
-        print(f"[ERR] {symbol}: HTTP {r.status_code}")
-        return False
-
-    txt = r.text
-    # Sprawdź limity / błędy API
-    try:
-        js = json.loads(txt)
-    except json.JSONDecodeError:
-        preview = txt[:120].replace("\n", " ").replace("\r", " ")
-        print(f"[WARN] {symbol}: non-JSON response: {preview}")
-        return False
-
-    for k in ("Note", "Information", "Error Message"):
-        if k in js:
-            preview = str(js.get(k, ""))[:200].replace("\n", " ").replace("\r", " ")
-            print(f"[WARN] {symbol}: API {k}: {preview}")
-            return False
-
-    # Znajdź klucz z danymi H1 (zwykle: "Time Series FX (60min)")
-    ts_key = None
-    for key in js.keys():
-        if "Time Series FX" in key:
-            ts_key = key
-            break
-
-    if not ts_key or not isinstance(js.get(ts_key), dict):
-        print(f"[WARN] {symbol}: Missing time series in response")
-        return False
-
-    ts = js[ts_key]
-    rows = []
-    for ts_str, ohlc in ts.items():
+def fetch_one(name: str, ticker: str) -> bool:
+    for attempt in range(3):
         try:
-            rows.append(
-                {
-                    "timestamp": ts_str,
-                    "open": float(ohlc["1. open"]),
-                    "high": float(ohlc["2. high"]),
-                    "low": float(ohlc["3. low"]),
-                    "close": float(ohlc["4. close"]),
-                }
+            df = yf.Ticker(ticker).history(
+                interval=INTERVAL, period=PERIOD, auto_adjust=False
             )
-        except Exception:
-            continue
+            if df is None or df.empty:
+                print(f"[WARN] {name}: empty frame (attempt {attempt+1}).")
+                time.sleep(1.5)
+                continue
 
-    if not rows:
-        print(f"[WARN] {symbol}: empty time series")
-        return False
+            # Index -> UTC-naive
+            idx = df.index
+            try:
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_convert("UTC")
+            except Exception:
+                pass
+            df = df.copy()
+            df.index = pd.to_datetime(idx).tz_localize(None)
 
-    df = pd.DataFrame(rows)
-    # sort od najstarszych do najnowszych
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+            out = df[["Open","High","Low","Close"]].rename(columns=str.lower)
+            out.reset_index(inplace=True)
+            out.rename(columns={"index":"timestamp","Datetime":"timestamp"}, inplace=True)
+            out["timestamp"] = pd.to_datetime(out["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = os.path.join(DATA_DIR, f"{symbol}.csv")
-    df.to_csv(out_path, index=False)
-    print(f"[OK] {symbol}: saved {len(df)} rows -> {out_path}")
-    return True
+            fn = os.path.join(OUTDIR, f"{name}.csv")
+            if os.path.exists(fn):
+                old = pd.read_csv(fn)
+                merged = pd.concat([old, out], ignore_index=True)
+                merged.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                merged.sort_values("timestamp", inplace=True)
+                out = merged
 
+            out.to_csv(fn, index=False)
+            print(f"[OK] {name} saved {len(out)} rows → {fn}")
+            return True
 
-def main():
-    ok, fail = 0, 0
-    for p in PAIRS:
-        success = fetch_pair(p["base"], p["quote"], p["symbol"])
-        if success:
-            ok += 1
-        else:
-            fail += 1
-        # przerwa między wywołaniami, by nie złapać limitów
-        time.sleep(WAIT_BETWEEN_CALLS)
-    print(f"Done. Success: {ok}, Failed: {fail}")
+        except Exception as e:
+            print(f"[ERR] {name}: {e.__class__.__name__}: {e}")
+            time.sleep(2)
 
+    return False
 
-if __name__ == "__main__":
-    main()
+ok = 0
+for name, tick in PAIRS.items():
+    if fetch_one(name, tick):
+        ok += 1
+    time.sleep(PAUSE_S)
+
+print(f"Done. Success: {ok}, Failed: {len(PAIRS) - ok}")
+sys.exit(0 if ok > 0 else 1)
