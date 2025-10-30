@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}       # ręczne uruchomienie
 
 permissions:
-  contents: write             # pozwala commitować zmiany
+  contents: write
 
 concurrency:
   group: update-fx-h1
@@ -35,6 +35,33 @@ jobs:
       - name: Build setups from CSVs
         run: python scripts/build_setups.py
 
+      - name: Make MT4-friendly CSV
+        run: |
+          python - << 'PY'
+          import json, csv, os
+          os.makedirs('signals', exist_ok=True)
+          data = json.load(open('signals/latest.json','r',encoding='utf-8'))
+          rows = []
+          for r in data.get('items', []):
+              if r.get('status') == 'setup':
+                  rows.append([
+                      r.get('pair',''),
+                      r.get('direction',''),
+                      r.get('entry',''),
+                      r.get('sl',''),
+                      r.get('tp',''),
+                      r.get('stop_pips',''),
+                      r.get('lot_size',''),
+                      int((r.get('risk_pct') or 0.0)*100),
+                      r.get('risk_usd',''),
+                      data.get('generated_at','')
+                  ])
+          with open('signals/mt4.csv','w',newline='',encoding='utf-8') as f:
+              w = csv.writer(f)
+              w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at'])
+              w.writerows(rows)
+          PY
+
       - name: Commit & push CSVs + signals
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -42,3 +69,4 @@ jobs:
           file_pattern: |
             data/*.csv
             signals/latest.*
+            signals/mt4.csv
