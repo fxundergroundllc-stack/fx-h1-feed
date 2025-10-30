@@ -1,48 +1,48 @@
-import os
-from datetime import datetime
-import pandas as pd
-import yfinance as yf
+# scripts/fetch_fx_h1.py
+import os, sys, time, io, requests, pandas as pd
 
-PAIRS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "USDCHF": "USDCHF=X",
-    "USDCAD": "USDCAD=X",
-    "AUDUSD": "AUDUSD=X",
-    "NZDUSD": "NZDUSD=X",
-}
+API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+if not API_KEY:
+    print("ERROR: Missing ALPHAVANTAGE_API_KEY", file=sys.stderr)
+    sys.exit(1)
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-os.makedirs(OUT_DIR, exist_ok=True)
+PAIRS = [
+    ("EUR","USD","EURUSD"),
+    ("GBP","USD","GBPUSD"),
+    ("USD","JPY","USDJPY"),
+    ("USD","CHF","USDCHF"),
+    ("USD","CAD","USDCAD"),
+    ("AUD","USD","AUDUSD"),
+    ("NZD","USD","NZDUSD"),
+]
 
-PERIOD = "60d"   # ~60 days back
-INTERVAL = "1h"  # hourly
-MAX_ROWS = 400   # keep last ~200-400 rows
+os.makedirs("data", exist_ok=True)
 
-for pair, ticker in PAIRS.items():
-    try:
-        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, auto_adjust=False, progress=False, threads=False)
-        if not {"Open", "High", "Low", "Close"}.issubset(df.columns):
-            print(f"[WARN] Missing OHLC for {pair} ({ticker}). Skipping.")
-            continue
+def fetch_pair(base, quote, symbol):
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
+        "&interval=60min&outputsize=compact&datatype=csv"
+        f"&apikey={API_KEY}"
+    )
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        print(f"[ERR] {symbol}: HTTP {r.status_code}")
+        return False
+    txt = r.text.strip()
+    if txt.startswith("Note") or txt.startswith("{"):
+        print(f"[WARN] {symbol}: API note/limit: {txt[:120].replace('\\n',' ')}")
+        return False
+    df = pd.read_csv(io.StringIO(txt))
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    df = df[["timestamp","open","high","low","close"]]
+    out = f"data/{symbol}.csv"
+    df.to_csv(out, index=False)
+    print(f"[OK] {symbol}: saved {len(df)} rows -> {out}")
+    return True
 
-        # Ensure UTC and flatten index
-        if df.index.tz is not None:
-            df = df.tz_convert("UTC")
-        df = df.tail(MAX_ROWS).copy()
-        df.reset_index(inplace=True)
-        df.rename(columns={
-            "Datetime": "timestamp",
-            "Date": "timestamp",
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-        }, inplace=True)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.strftime("%Y-%m-%d %H:%M:%S")
-        out_path = os.path.join(OUT_DIR, f"{pair}.csv")
-        df[["timestamp", "open", "high", "low", "close"]].to_csv(out_path, index=False)
-        print(f"[OK] Wrote {out_path} with {len(df)} rows")
-    except Exception as e:
-        print(f"[ERR] {pair} ({ticker}): {e}")
+PAUSE_S = 15  # limit 5 req/min → pauza między parami
+for i, (base, quote, sym) in enumerate(PAIRS):
+    fetch_pair(base, quote, sym)
+    if i < len(PAIRS)-1:
+        time.sleep(PAUSE_S)
