@@ -1,33 +1,5 @@
-name: update-fx-h1
+- name: Install deps
+  run: pip install yfinance pandas
 
-on:
-  schedule:
-    - cron: '*/30 * * * *'   # co 30 minut
-  workflow_dispatch: {}       # pozwala ręcznie uruchomić
-
-permissions:
-  contents: write   # pozwala commitować CSV
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: pip install requests pandas
-
-      - name: Fetch H1 OHLC CSVs
-        env:
-          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-        run: python scripts/fetch_fx_h1.py
-
-      - name: Commit & push CSVs
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Update: FX H1 feed"
-          file_pattern: data/*.csv
+- name: Fetch H1 OHLC CSVs
+  run: python scripts/fetch_fx_h1.py
