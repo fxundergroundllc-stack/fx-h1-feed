@@ -2,20 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Pobiera H1 z Yahoo Finance i zapisuje CSV w katalogu 'data/'.
-- Obsługa majors: EURUSD, GBPUSD, USDJPY, USDCHF, USDCAD, AUDUSD, NZDUSD
-- Flatten tablic z YF (naprawia 'Data must be 1-dimensional')
+- Par y: EURUSD, GBPUSD, USDJPY, USDCHF, USDCAD, AUDUSD, NZDUSD
+- Flatten tablic z YF
+- Konwersja do pandas.Series przed to_numeric (naprawia błąd fillna)
 - Odrzuca bieżącą (niezamkniętą) świecę
 - Dedup po czasie i łączenie z istniejącym CSV
-
-Uruchamianie:
-  python scripts/fetch_fx_h1.py
-  python scripts/fetch_fx_h1.py EURUSD USDJPY
-  PAIRS="EURUSD,USDJPY" python scripts/fetch_fx_h1.py
-
-ENV (opcjonalnie):
-  OUT_DIR=data
-  INTERVAL=60m
-  RANGE=10d
 """
 
 import os
@@ -33,7 +24,6 @@ OUT_DIR = os.getenv("OUT_DIR", "data")
 INTERVAL = os.getenv("INTERVAL", "60m")
 RANGE = os.getenv("RANGE", "10d")
 
-# Mapowanie par -> symbole Yahoo
 SYMBOL_MAP = {
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
@@ -48,10 +38,16 @@ UA = {"User-Agent": "Mozilla/5.0 (compatible; fx-h1-feed/1.0)"}
 
 
 def _flat(x):
+    """Zwraca 1D numpy array."""
     a = np.asarray(x)
     if a.ndim > 1:
         a = a.reshape(-1)
     return a
+
+
+def _num_series(x):
+    """Zamienia wejście na pandas.Series i rzutuje numerycznie z NaN dla błędów."""
+    return pd.to_numeric(pd.Series(_flat(x)), errors="coerce")
 
 
 def fetch_yf_chart(symbol: str, interval: str = INTERVAL, range_: str = RANGE) -> dict:
@@ -59,19 +55,17 @@ def fetch_yf_chart(symbol: str, interval: str = INTERVAL, range_: str = RANGE) -
     r = requests.get(url, headers=UA, timeout=30)
     r.raise_for_status()
     j = r.json()
-
     ok = j.get("chart", {}).get("result", [])
     if ok and ok[0].get("timestamp"):
         return j
 
-    # fallback: ostatnie 14 dni przez period1/period2
+    # fallback: period1/period2
     now = int(time.time())
     p1 = now - 14 * 24 * 3600
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&period1={p1}&period2={now}&includePrePost=false"
     r = requests.get(url, headers=UA, timeout=30)
     r.raise_for_status()
     j = r.json()
-
     ok = j.get("chart", {}).get("result", [])
     if not ok or not ok[0].get("timestamp"):
         raise RuntimeError(f"Brak danych z YF dla {symbol}")
@@ -87,17 +81,26 @@ def chart_to_df(chart_json: dict) -> pd.DataFrame:
     h = _flat(q.get("high"))
     l = _flat(q.get("low"))
     c = _flat(q.get("close"))
-    v = _flat(q.get("volume", np.zeros_like(ts)))
 
-    n = min(len(ts), len(o), len(h), len(l), len(c), len(v))
+    # długość wg OHLC (volume bywa brakujące w FX)
+    n = min(len(ts), len(o), len(h), len(l), len(c))
+
+    # volume: jeśli brak w JSON → wektor zer
+    vol_raw = q.get("volume", None)
+    if vol_raw is None:
+        v = np.zeros(n, dtype=float)
+        vol_series = pd.Series(v)
+    else:
+        vol_series = _num_series(vol_raw)[:n].fillna(0)
+
     df = pd.DataFrame(
         {
             "time": pd.to_datetime(ts[:n], unit="s", utc=True),
-            "open": pd.to_numeric(o[:n], errors="coerce"),
-            "high": pd.to_numeric(h[:n], errors="coerce"),
-            "low": pd.to_numeric(l[:n], errors="coerce"),
-            "close": pd.to_numeric(c[:n], errors="coerce"),
-            "volume": pd.to_numeric(v[:n], errors="coerce").fillna(0),
+            "open": _num_series(o)[:n],
+            "high": _num_series(h)[:n],
+            "low": _num_series(l)[:n],
+            "close": _num_series(c)[:n],
+            "volume": vol_series,
         }
     )
 
@@ -105,6 +108,7 @@ def chart_to_df(chart_json: dict) -> pd.DataFrame:
     now_full_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     df = df[df["time"] < now_full_hour]
 
+    # usuń NaN w OHLC i duplikaty po czasie
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
     return df
@@ -143,6 +147,7 @@ def run_for_pair(pair: str) -> dict:
     df = chart_to_df(j)
     df = merge_with_existing(key, df)
     path = save_csv(key, df)
+    print(f"[{key}] zapisano {len(df)} wierszy -> {path}")
     return {"pair": key, "rows": int(len(df)), "path": str(path)}
 
 
@@ -151,9 +156,7 @@ def main(pairs: list[str]) -> int:
     results, ok = [], True
     for p in pairs:
         try:
-            r = run_for_pair(p)
-            print(f"[{r['pair']}] zapisano {r['rows']} wierszy -> {r['path']}")
-            results.append(r)
+            results.append(run_for_pair(p))
         except Exception as e:
             ok = False
             print(f"[{p}] ERROR: {e}")
@@ -167,6 +170,5 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1:
         pairs = [s.strip() for s in sys.argv[1:] if s.strip()]
     else:
-        # Domyślnie: pełny zestaw majors
         pairs = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"]
     sys.exit(main(pairs))
