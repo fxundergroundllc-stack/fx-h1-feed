@@ -1,0 +1,83 @@
+name: update-fx-h1
+
+on:
+  schedule:
+    - cron: "5 * * * *"     # co godzinę o :05 (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-fx-h1
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OUT_DIR: data
+      PAIRS: EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,BTCUSD
+      TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U pandas numpy requests
+
+      - name: Fetch H1 OHLC CSVs (Twelve Data)
+        run: python scripts/fetch_fx_h1.py
+
+      - name: Build setups from CSVs (EMA/ATR)
+        run: python scripts/build_setups.py
+
+      - name: Build PRO signals (DMACD, Confluence, VWAP, POC)
+        run: python scripts/build_pro_signals.py
+
+      - name: Make MT4-friendly CSV
+        run: |
+          python - << 'PY'
+          import json, csv, os, datetime
+          os.makedirs('signals', exist_ok=True)
+          data = {"items": [], "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+          p = 'signals/latest.json'
+          if os.path.exists(p):
+              try:
+                  with open(p,'r',encoding='utf-8') as f: data = json.load(f)
+              except Exception: pass
+          rows = []
+          for r in data.get('items', []):
+              if str(r.get('status','')).lower() == 'setup':
+                  rows.append([
+                      r.get('pair',''), r.get('direction',''), r.get('entry',''),
+                      r.get('sl',''), r.get('tp',''), r.get('stop_pips',''),
+                      r.get('lot_size',''), int(round((r.get('risk_pct') or 0.0)*100)),
+                      r.get('risk_usd',''), data.get('generated_at','')
+                  ])
+          with open('signals/mt4.csv','w',newline='',encoding='utf-8') as f:
+              w = csv.writer(f)
+              w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at'])
+              w.writerows(rows)
+          PY
+
+      - name: Commit & push CSVs + signals
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update: FX H1 (Twelve Data) + setups + PRO signals"
+          file_pattern: |
+            data/*.csv
+            signals/latest.*
+            signals/mt4.csv
+            signals/pro.json
+            signals/levels_*.csv
+            signals/poc_*.csv
