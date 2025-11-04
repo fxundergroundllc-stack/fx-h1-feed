@@ -19,6 +19,14 @@ jobs:
       OUT_DIR: data
       PAIRS: EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,BTCUSD
       TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
+
+      # ======= PRO FILTRY – USTAWIENIA =======
+      PRO_FILTERS: "1"              # 1 = włącz filtry PRO, 0 = wyłącz
+      REQUIRE_MACD_SIGN: "1"        # 1 = histogram MACD musi zgadzać się z kierunkiem
+      MIN_CONF_SCORE: "2.0"         # minimalny score strefy confluence
+      MAX_DIST_TO_ZONE_PIPS: "15"   # maks. odległość ENTRY od strefy (w pipsach)
+      # =======================================
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,36 +52,113 @@ jobs:
       - name: Build PRO signals (DMACD, Confluence, VWAP, POC)
         run: python scripts/build_pro_signals.py
 
-      - name: Make MT4-friendly CSV
+      # ======= TU PODMIANA: nowy krok robi CSV z filtrami PRO =======
+      - name: Make MT4-friendly CSV (with PRO filters)
+        env:
+          PRO_FILTERS: ${{ env.PRO_FILTERS }}
+          REQUIRE_MACD_SIGN: ${{ env.REQUIRE_MACD_SIGN }}
+          MIN_CONF_SCORE: ${{ env.MIN_CONF_SCORE }}
+          MAX_DIST_TO_ZONE_PIPS: ${{ env.MAX_DIST_TO_ZONE_PIPS }}
         run: |
           python - << 'PY'
-          import json, csv, os, datetime
-          os.makedirs('signals', exist_ok=True)
-          data = {"items": [], "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
-          p = 'signals/latest.json'
-          if os.path.exists(p):
+          import json, csv, os
+
+          def pip_size(pair:str)->float:
+              if pair == "BTCUSD": return 1.0
+              if pair == "XAUUSD": return 0.01
+              if pair.endswith("JPY"): return 0.01
+              return 0.0001
+
+          PRO_ON   = os.getenv("PRO_FILTERS","0") == "1"
+          REQ_MACD = os.getenv("REQUIRE_MACD_SIGN","1") == "1"
+          MIN_SC   = float(os.getenv("MIN_CONF_SCORE","2.0"))
+          MAX_DZ   = float(os.getenv("MAX_DIST_TO_ZONE_PIPS","15"))
+
+          def load_json(path, default):
               try:
-                  with open(p,'r',encoding='utf-8') as f: data = json.load(f)
-              except Exception: pass
+                  with open(path,'r',encoding='utf-8') as f:
+                      return json.load(f)
+              except Exception:
+                  return default
+
+          latest = load_json('signals/latest.json', {"items":[],"generated_at":""})
+          pro    = load_json('signals/pro.json',    {"items":[]})
+
+          # indeks PRO po parze
+          pro_map = { (it.get("pair","").upper()): it for it in pro.get("items", []) }
+
+          def pass_pro_filters(row):
+              if not PRO_ON:
+                  return True
+              p = row.get("pair","").upper()
+              it = pro_map.get(p)
+              if not it:
+                  # brak metryk PRO => przepuszczamy
+                  return True
+
+              direction = row.get("direction")
+              entry = float(row.get("entry"))
+
+              # 1) MACD histogram zgodnie z kierunkiem
+              if REQ_MACD:
+                  hist = (it.get("macd") or {}).get("hist")
+                  if hist is None:
+                      return True
+                  if direction == "long"  and hist < 0: return False
+                  if direction == "short" and hist > 0: return False
+
+              # 2) Confluence: najlepsza strefa musi mieć score i bliskość
+              zones = it.get("confluence") or []
+              if zones:
+                  best = zones[0]  # posortowane po score/bliskości
+                  try:
+                      score = float(best.get("score", 0.0))
+                      center = float(best.get("center", entry))
+                  except Exception:
+                      return True
+                  if score < MIN_SC:
+                      return False
+                  ps = pip_size(p)
+                  dist_pips = abs(entry - center)/ps
+                  if dist_pips > MAX_DZ:
+                      return False
+
+              return True
+
+          os.makedirs('signals', exist_ok=True)
           rows = []
-          for r in data.get('items', []):
-              if str(r.get('status','')).lower() == 'setup':
-                  rows.append([
-                      r.get('pair',''), r.get('direction',''), r.get('entry',''),
-                      r.get('sl',''), r.get('tp',''), r.get('stop_pips',''),
-                      r.get('lot_size',''), int(round((r.get('risk_pct') or 0.0)*100)),
-                      r.get('risk_usd',''), data.get('generated_at','')
-                  ])
+          for r in latest.get('items', []):
+              if str(r.get('status','')).lower() != 'setup':
+                  continue
+              if not pass_pro_filters(r):
+                  # odrzucone przez PRO – nie trafia do CSV
+                  continue
+              rows.append([
+                  r.get('pair',''),
+                  r.get('direction',''),
+                  r.get('entry',''),
+                  r.get('sl',''),
+                  r.get('tp',''),
+                  r.get('stop_pips',''),
+                  r.get('lot_size',''),
+                  int(round((r.get('risk_pct') or 0.0)*100)),
+                  r.get('risk_usd',''),
+                  latest.get('generated_at','')
+              ])
+
           with open('signals/mt4.csv','w',newline='',encoding='utf-8') as f:
               w = csv.writer(f)
               w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at'])
               w.writerows(rows)
+
+          print(f"[MT4 CSV] rows={len(rows)} PRO_FILTERS={PRO_ON}")
           PY
+      # =============================================================
 
       - name: Commit & push CSVs + signals
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update: FX H1 (Twelve Data) + setups + PRO signals"
+          commit_message: "Update: FX H1 (Twelve Data) + setups + PRO (filtered CSV)"
           file_pattern: |
             data/*.csv
             signals/latest.*
