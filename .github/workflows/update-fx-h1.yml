@@ -2,8 +2,8 @@ name: update-fx-h1
 
 on:
   schedule:
-    - cron: "5 * * * *"     # co godzinę o :05 (UTC)
-  workflow_dispatch: {}
+    - cron: "5 * * * *"     # co godzinę o :05 UTC
+  workflow_dispatch: {}      # ręczne uruchomienie
 
 permissions:
   contents: write
@@ -15,17 +15,41 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     env:
       OUT_DIR: data
       PAIRS: EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,BTCUSD
       TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
 
-      # ======= PRO FILTRY – USTAWIENIA =======
-      PRO_FILTERS: "1"              # 1 = włącz filtry PRO, 0 = wyłącz
-      REQUIRE_MACD_SIGN: "1"        # 1 = histogram MACD musi zgadzać się z kierunkiem
-      MIN_CONF_SCORE: "2.0"         # minimalny score strefy confluence
-      MAX_DIST_TO_ZONE_PIPS: "15"   # maks. odległość ENTRY od strefy (w pipsach)
-      # =======================================
+      # --- SL/TP (generator bazowy) ---
+      ATR_MULT_SL: "1.5"
+      TP_R_MULT:   "2.0"
+
+      # --- PRO: (build_pro_signals.py) – mogą być, ale NIE są obowiązkowe do lotów ---
+      # (zostaw jak masz – one tylko zasilają pro.json)
+      # ...
+
+      # --- ATOMY: co liczymy jako +0.01 lota (ON/OFF) ---
+      USE_RULE_MACD_SIGN: "1"       # DMACD(8,17,9) histogram po stronie kierunku
+      USE_RULE_SIDE_EMA200: "1"     # cena po właściwej stronie EMA200
+      USE_RULE_EMA_STACK: "1"       # EMA20>EMA50>EMA200 (LONG) / odwrotnie (SHORT)
+      USE_RULE_SIDE_VWAP: "1"       # cena po właściwej stronie dziennego VWAP (jeśli dostępny)
+      USE_RULE_NEAR_POC: "1"        # entry blisko POC (jeśli dostępny)
+      USE_RULE_NEAR_EMA20: "0"      # entry blisko EMA20 (tolerancja w pipsach)
+      USE_RULE_NEAR_EMA50: "0"      # entry blisko EMA50 (tolerancja w pipsach)
+
+      # --- FIBO & SWINGI (też atomy) ---
+      USE_RULE_FIBO_RETRACE: "1"    # entry blisko 38.2% lub 61.8% ostatniego swingu
+      USE_RULE_FIBO_EXT_TP:  "1"    # TP blisko 1.272 lub 1.618 rozszerzenia swingu
+      USE_RULE_SWING_BREAKOUT: "1"  # entry wybija poprzedni swing high/low
+
+      # --- progi / lookbacki ---
+      FIBO_LOOKBACK: "80"           # ile świec wstecz do wyznaczenia swingu
+      SWING_LOOKBACK: "30"          # okno do swing high/low
+      PIPS_NEAR_FIBO: "12"          # tolerancja pips do 38.2/61.8
+      PIPS_NEAR_EXT:  "12"          # tolerancja pips do 1.272/1.618
+      PIPS_NEAR_MA: "10"            # tolerancja pips do EMA20/EMA50
+      PIPS_NEAR_POC: "10"           # tolerancja pips do POC
 
     steps:
       - name: Checkout
@@ -52,113 +76,218 @@ jobs:
       - name: Build PRO signals (DMACD, Confluence, VWAP, POC)
         run: python scripts/build_pro_signals.py
 
-      # ======= TU PODMIANA: nowy krok robi CSV z filtrami PRO =======
-      - name: Make MT4-friendly CSV (with PRO filters)
+      # ====== ATOMY: zlicz + dopisz rule_score & rules do mt4.csv ======
+      - name: Make MT4-friendly CSV (atomic rules incl. FIBO & SWINGS, +0.01/each)
         env:
-          PRO_FILTERS: ${{ env.PRO_FILTERS }}
-          REQUIRE_MACD_SIGN: ${{ env.REQUIRE_MACD_SIGN }}
-          MIN_CONF_SCORE: ${{ env.MIN_CONF_SCORE }}
-          MAX_DIST_TO_ZONE_PIPS: ${{ env.MAX_DIST_TO_ZONE_PIPS }}
+          USE_RULE_MACD_SIGN:     ${{ env.USE_RULE_MACD_SIGN }}
+          USE_RULE_SIDE_EMA200:   ${{ env.USE_RULE_SIDE_EMA200 }}
+          USE_RULE_EMA_STACK:     ${{ env.USE_RULE_EMA_STACK }}
+          USE_RULE_SIDE_VWAP:     ${{ env.USE_RULE_SIDE_VWAP }}
+          USE_RULE_NEAR_POC:      ${{ env.USE_RULE_NEAR_POC }}
+          USE_RULE_NEAR_EMA20:    ${{ env.USE_RULE_NEAR_EMA20 }}
+          USE_RULE_NEAR_EMA50:    ${{ env.USE_RULE_NEAR_EMA50 }}
+          USE_RULE_FIBO_RETRACE:  ${{ env.USE_RULE_FIBO_RETRACE }}
+          USE_RULE_FIBO_EXT_TP:   ${{ env.USE_RULE_FIBO_EXT_TP }}
+          USE_RULE_SWING_BREAKOUT:${{ env.USE_RULE_SWING_BREAKOUT }}
+
+          FIBO_LOOKBACK: ${{ env.FIBO_LOOKBACK }}
+          SWING_LOOKBACK: ${{ env.SWING_LOOKBACK }}
+          PIPS_NEAR_FIBO: ${{ env.PIPS_NEAR_FIBO }}
+          PIPS_NEAR_EXT:  ${{ env.PIPS_NEAR_EXT }}
+          PIPS_NEAR_MA:   ${{ env.PIPS_NEAR_MA }}
+          PIPS_NEAR_POC:  ${{ env.PIPS_NEAR_POC }}
         run: |
           python - << 'PY'
-          import json, csv, os
+          import os, csv, json, math
+          import pandas as pd
 
           def pip_size(pair:str)->float:
-              if pair == "BTCUSD": return 1.0
-              if pair == "XAUUSD": return 0.01
-              if pair.endswith("JPY"): return 0.01
-              return 0.0001
-
-          PRO_ON   = os.getenv("PRO_FILTERS","0") == "1"
-          REQ_MACD = os.getenv("REQUIRE_MACD_SIGN","1") == "1"
-          MIN_SC   = float(os.getenv("MIN_CONF_SCORE","2.0"))
-          MAX_DZ   = float(os.getenv("MAX_DIST_TO_ZONE_PIPS","15"))
+              pu = pair.upper()
+              if pu=="BTCUSD": return 1.0
+              if pu=="XAUUSD": return 0.01
+              return 0.01 if pu.endswith("JPY") else 0.0001
 
           def load_json(path, default):
               try:
-                  with open(path,'r',encoding='utf-8') as f:
-                      return json.load(f)
+                  with open(path,'r',encoding='utf-8') as f: return json.load(f)
               except Exception:
                   return default
 
+          def load_pair_df(pair):
+              path = os.path.join("data", f"{pair}.csv")
+              df = pd.read_csv(path)
+              cols = {c.lower(): c for c in df.columns}
+              tcol = cols.get("timestamp") or cols.get("time") or cols.get("datetime") or list(df.columns)[0]
+              ocol = cols.get("open") or "open"
+              hcol = cols.get("high") or "high"
+              lcol = cols.get("low")  or "low"
+              ccol = cols.get("close") or "close"
+              df = df.rename(columns={tcol:"timestamp", ocol:"open", hcol:"high", lcol:"low", ccol:"close"})
+              df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+              return df.dropna().sort_values("timestamp").reset_index(drop=True)
+
           latest = load_json('signals/latest.json', {"items":[],"generated_at":""})
           pro    = load_json('signals/pro.json',    {"items":[]})
-
-          # indeks PRO po parze
+          gen_ts = latest.get("generated_at","")
           pro_map = { (it.get("pair","").upper()): it for it in pro.get("items", []) }
 
-          def pass_pro_filters(row):
-              if not PRO_ON:
-                  return True
-              p = row.get("pair","").upper()
-              it = pro_map.get(p)
-              if not it:
-                  # brak metryk PRO => przepuszczamy
-                  return True
+          E = os.environ.get
+          use = {
+            "MACD_SIGN":       E("USE_RULE_MACD_SIGN","1")       == "1",
+            "SIDE_EMA200":     E("USE_RULE_SIDE_EMA200","1")     == "1",
+            "EMA_STACK":       E("USE_RULE_EMA_STACK","1")       == "1",
+            "SIDE_VWAP":       E("USE_RULE_SIDE_VWAP","1")       == "1",
+            "NEAR_POC":        E("USE_RULE_NEAR_POC","1")        == "1",
+            "NEAR_EMA20":      E("USE_RULE_NEAR_EMA20","0")      == "1",
+            "NEAR_EMA50":      E("USE_RULE_NEAR_EMA50","0")      == "1",
+            "FIBO_RETRACE":    E("USE_RULE_FIBO_RETRACE","1")    == "1",
+            "FIBO_EXT_TP":     E("USE_RULE_FIBO_EXT_TP","1")     == "1",
+            "SWING_BREAKOUT":  E("USE_RULE_SWING_BREAKOUT","1")  == "1",
+          }
+          FIBO_LOOKBACK   = int(E("FIBO_LOOKBACK","80"))
+          SWING_LOOKBACK  = int(E("SWING_LOOKBACK","30"))
+          PIPS_NEAR_FIBO  = float(E("PIPS_NEAR_FIBO","12"))
+          PIPS_NEAR_EXT   = float(E("PIPS_NEAR_EXT","12"))
+          PIPS_NEAR_MA    = float(E("PIPS_NEAR_MA","10"))
+          PIPS_NEAR_POC   = float(E("PIPS_NEAR_POC","10"))
 
-              direction = row.get("direction")
-              entry = float(row.get("entry"))
+          def fibo_levels(direction, high, low):
+              if direction=="long":
+                  top, base = high, low
+                  r382 = top - 0.382*(top-base)
+                  r618 = top - 0.618*(top-base)
+                  ext127 = top + 0.272*(top-base)
+                  ext161 = top + 0.618*(top-base)
+              else:
+                  base, top = high, low
+                  r382 = top + 0.382*(base-top)
+                  r618 = top + 0.618*(base-top)
+                  ext127 = top - 0.272*(base-top)
+                  ext161 = top - 0.618*(base-top)
+              return r382, r618, ext127, ext161
 
-              # 1) MACD histogram zgodnie z kierunkiem
-              if REQ_MACD:
-                  hist = (it.get("macd") or {}).get("hist")
-                  if hist is None:
-                      return True
-                  if direction == "long"  and hist < 0: return False
-                  if direction == "short" and hist > 0: return False
-
-              # 2) Confluence: najlepsza strefa musi mieć score i bliskość
-              zones = it.get("confluence") or []
-              if zones:
-                  best = zones[0]  # posortowane po score/bliskości
-                  try:
-                      score = float(best.get("score", 0.0))
-                      center = float(best.get("center", entry))
-                  except Exception:
-                      return True
-                  if score < MIN_SC:
-                      return False
-                  ps = pip_size(p)
-                  dist_pips = abs(entry - center)/ps
-                  if dist_pips > MAX_DZ:
-                      return False
-
-              return True
-
-          os.makedirs('signals', exist_ok=True)
-          rows = []
-          for r in latest.get('items', []):
-              if str(r.get('status','')).lower() != 'setup':
+          rows_out = []
+          for r in latest.get("items", []):
+              if str(r.get("status","")).lower() != "setup":
                   continue
-              if not pass_pro_filters(r):
-                  # odrzucone przez PRO – nie trafia do CSV
-                  continue
-              rows.append([
-                  r.get('pair',''),
-                  r.get('direction',''),
-                  r.get('entry',''),
-                  r.get('sl',''),
-                  r.get('tp',''),
-                  r.get('stop_pips',''),
-                  r.get('lot_size',''),
-                  int(round((r.get('risk_pct') or 0.0)*100)),
-                  r.get('risk_usd',''),
-                  latest.get('generated_at','')
+
+              pair = str(r.get("pair","")).upper()
+              direction = r.get("direction")
+              entry = float(r.get("entry"))
+              tp    = float(r.get("tp"))
+              ema20 = float(r.get("ema20", entry))
+              ema50 = float(r.get("ema50", entry))
+              ema200= float(r.get("ema200", entry))
+              ps    = pip_size(pair)
+
+              rules_hit = []
+
+              it = pro_map.get(pair, {})
+              # --- MACD ---
+              if use["MACD_SIGN"]:
+                  hist = None
+                  if isinstance(it.get("macd"), dict):
+                      hist = it["macd"].get("hist")
+                  if hist is not None:
+                      ok = (direction=="long" and hist>0) or (direction=="short" and hist<0)
+                      if ok: rules_hit.append("MACD_SIGN")
+              # --- VWAP ---
+              if use["SIDE_VWAP"]:
+                  vwap = it.get("vwap")
+                  if vwap is not None:
+                      ok = (direction=="long" and entry>float(vwap)) or (direction=="short" and entry<float(vwap))
+                      if ok: rules_hit.append("SIDE_VWAP")
+              # --- POC ---
+              if use["NEAR_POC"]:
+                  poc = None
+                  if isinstance(it.get("poc"), dict):
+                      poc = it["poc"].get("price")
+                  if poc is not None and abs(entry-float(poc))/ps <= PIPS_NEAR_POC:
+                      rules_hit.append("NEAR_POC")
+
+              # --- EMA oparte ---
+              if use["SIDE_EMA200"]:
+                  if (direction=="long" and entry>ema200) or (direction=="short" and entry<ema200):
+                      rules_hit.append("SIDE_EMA200")
+              if use["EMA_STACK"]:
+                  if (direction=="long" and (ema20>ema50>ema200)) or (direction=="short" and (ema20<ema50<ema200)):
+                      rules_hit.append("EMA_STACK")
+              if use["NEAR_EMA20"]:
+                  if abs(entry-ema20)/ps <= PIPS_NEAR_MA:
+                      rules_hit.append("NEAR_EMA20")
+              if use["NEAR_EMA50"]:
+                  if abs(entry-ema50)/ps <= PIPS_NEAR_MA:
+                      rules_hit.append("NEAR_EMA50")
+
+              # --- FIBO & SWINGI ---
+              try:
+                  df = load_pair_df(pair)
+                  sig_ts = pd.to_datetime(r.get("signal_bar", None), utc=True, errors="coerce")
+                  if pd.isna(sig_ts):
+                      i_entry = len(df)-1
+                  else:
+                      i_entry = int(df.index[df["timestamp"].searchsorted(sig_ts, side="right")] - 1)
+                      if i_entry < 1: i_entry = len(df)-1
+
+                  w = df.iloc[max(0, i_entry - max(FIBO_LOOKBACK, SWING_LOOKBACK)) : i_entry+1]
+                  swing_high = float(w["high"].max())
+                  swing_low  = float(w["low"].min())
+                  r382, r618, ext127, ext161 = fibo_levels(direction, swing_high, swing_low)
+
+                  # FIBO_RETRACE (entry blisko 38.2/61.8)
+                  if use["FIBO_RETRACE"]:
+                      if (abs(entry-r382)/ps <= PIPS_NEAR_FIBO) or (abs(entry-r618)/ps <= PIPS_NEAR_FIBO):
+                          rules_hit.append("FIBO_RETRACE")
+
+                  # FIBO_EXT_TP (TP blisko 1.272/1.618)
+                  if use["FIBO_EXT_TP"]:
+                      if (abs(tp-ext127)/ps <= PIPS_NEAR_EXT) or (abs(tp-ext161)/ps <= PIPS_NEAR_EXT):
+                          rules_hit.append("FIBO_EXT_TP")
+
+                  # SWING_BREAKOUT (entry wybija poprzedni swing)
+                  if use["SWING_BREAKOUT"]:
+                      w2 = df.iloc[max(0, i_entry - SWING_LOOKBACK) : i_entry]
+                      if len(w2) > 0:
+                          prev_high = float(w2["high"].max())
+                          prev_low  = float(w2["low"].min())
+                          if (direction=="long" and entry>prev_high) or (direction=="short" and entry<prev_low):
+                              rules_hit.append("SWING_BREAKOUT")
+              except Exception:
+                  pass
+
+              # 1 = sam cross (sygnał bazowy) + 1 za każdy ATOM:
+              rule_score = 1 + len(rules_hit)
+
+              # zapis do CSV
+              rows_out.append([
+                  pair,
+                  direction,
+                  r.get("entry",""),
+                  r.get("sl",""),
+                  r.get("tp",""),
+                  r.get("stop_pips",""),
+                  r.get("lot_size",""),
+                  int(round((r.get("risk_pct") or 0.0)*100)),
+                  r.get("risk_usd",""),
+                  gen_ts,
+                  rule_score,
+                  ";".join(rules_hit)
               ])
 
+          os.makedirs('signals', exist_ok=True)
           with open('signals/mt4.csv','w',newline='',encoding='utf-8') as f:
               w = csv.writer(f)
-              w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at'])
-              w.writerows(rows)
+              w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at','rule_score','rules'])
+              w.writerows(rows_out)
 
-          print(f"[MT4 CSV] rows={len(rows)} PRO_FILTERS={PRO_ON}")
+          print(f"[MT4 CSV] rows={len(rows_out)}; rule_score=1+atoms; rules=[lista atomów]")
           PY
-      # =============================================================
+      # ================================================================
 
       - name: Commit & push CSVs + signals
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update: FX H1 (Twelve Data) + setups + PRO (filtered CSV)"
+          commit_message: "Update: FX H1 + atomic rules → mt4.csv (rule_score & rules)"
           file_pattern: |
             data/*.csv
             signals/latest.*
