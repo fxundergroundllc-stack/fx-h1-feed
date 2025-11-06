@@ -25,18 +25,14 @@ jobs:
       ATR_MULT_SL: "1.5"
       TP_R_MULT:   "2.0"
 
-      # --- PRO: (build_pro_signals.py) – mogą być, ale NIE są obowiązkowe do lotów ---
-      # (zostaw jak masz – one tylko zasilają pro.json)
-      # ...
-
-      # --- ATOMY: co liczymy jako +0.01 lota (ON/OFF) ---
+      # --- ATOMY: +0.01 lota za każdy spełniony warunek ---
       USE_RULE_MACD_SIGN: "1"       # DMACD(8,17,9) histogram po stronie kierunku
       USE_RULE_SIDE_EMA200: "1"     # cena po właściwej stronie EMA200
       USE_RULE_EMA_STACK: "1"       # EMA20>EMA50>EMA200 (LONG) / odwrotnie (SHORT)
       USE_RULE_SIDE_VWAP: "1"       # cena po właściwej stronie dziennego VWAP (jeśli dostępny)
       USE_RULE_NEAR_POC: "1"        # entry blisko POC (jeśli dostępny)
-      USE_RULE_NEAR_EMA20: "0"      # entry blisko EMA20 (tolerancja w pipsach)
-      USE_RULE_NEAR_EMA50: "0"      # entry blisko EMA50 (tolerancja w pipsach)
+      USE_RULE_NEAR_EMA20: "0"      # entry blisko EMA20
+      USE_RULE_NEAR_EMA50: "0"      # entry blisko EMA50
 
       # --- FIBO & SWINGI (też atomy) ---
       USE_RULE_FIBO_RETRACE: "1"    # entry blisko 38.2% lub 61.8% ostatniego swingu
@@ -44,12 +40,12 @@ jobs:
       USE_RULE_SWING_BREAKOUT: "1"  # entry wybija poprzedni swing high/low
 
       # --- progi / lookbacki ---
-      FIBO_LOOKBACK: "80"           # ile świec wstecz do wyznaczenia swingu
-      SWING_LOOKBACK: "30"          # okno do swing high/low
-      PIPS_NEAR_FIBO: "12"          # tolerancja pips do 38.2/61.8
-      PIPS_NEAR_EXT:  "12"          # tolerancja pips do 1.272/1.618
-      PIPS_NEAR_MA: "10"            # tolerancja pips do EMA20/EMA50
-      PIPS_NEAR_POC: "10"           # tolerancja pips do POC
+      FIBO_LOOKBACK: "80"
+      SWING_LOOKBACK: "30"
+      PIPS_NEAR_FIBO: "12"
+      PIPS_NEAR_EXT:  "12"
+      PIPS_NEAR_MA: "10"
+      PIPS_NEAR_POC: "10"
 
     steps:
       - name: Checkout
@@ -79,18 +75,18 @@ jobs:
       # ====== ATOMY: zlicz + dopisz rule_score & rules do mt4.csv ======
       - name: Make MT4-friendly CSV (atomic rules incl. FIBO & SWINGS, +0.01/each)
         env:
-          USE_RULE_MACD_SIGN:     ${{ env.USE_RULE_MACD_SIGN }}
-          USE_RULE_SIDE_EMA200:   ${{ env.USE_RULE_SIDE_EMA200 }}
-          USE_RULE_EMA_STACK:     ${{ env.USE_RULE_EMA_STACK }}
-          USE_RULE_SIDE_VWAP:     ${{ env.USE_RULE_SIDE_VWAP }}
-          USE_RULE_NEAR_POC:      ${{ env.USE_RULE_NEAR_POC }}
-          USE_RULE_NEAR_EMA20:    ${{ env.USE_RULE_NEAR_EMA20 }}
-          USE_RULE_NEAR_EMA50:    ${{ env.USE_RULE_NEAR_EMA50 }}
-          USE_RULE_FIBO_RETRACE:  ${{ env.USE_RULE_FIBO_RETRACE }}
-          USE_RULE_FIBO_EXT_TP:   ${{ env.USE_RULE_FIBO_EXT_TP }}
-          USE_RULE_SWING_BREAKOUT:${{ env.USE_RULE_SWING_BREAKOUT }}
+          USE_RULE_MACD_SIGN:      ${{ env.USE_RULE_MACD_SIGN }}
+          USE_RULE_SIDE_EMA200:    ${{ env.USE_RULE_SIDE_EMA200 }}
+          USE_RULE_EMA_STACK:      ${{ env.USE_RULE_EMA_STACK }}
+          USE_RULE_SIDE_VWAP:      ${{ env.USE_RULE_SIDE_VWAP }}
+          USE_RULE_NEAR_POC:       ${{ env.USE_RULE_NEAR_POC }}
+          USE_RULE_NEAR_EMA20:     ${{ env.USE_RULE_NEAR_EMA20 }}
+          USE_RULE_NEAR_EMA50:     ${{ env.USE_RULE_NEAR_EMA50 }}
+          USE_RULE_FIBO_RETRACE:   ${{ env.USE_RULE_FIBO_RETRACE }}
+          USE_RULE_FIBO_EXT_TP:    ${{ env.USE_RULE_FIBO_EXT_TP }}
+          USE_RULE_SWING_BREAKOUT: ${{ env.USE_RULE_SWING_BREAKOUT }}
 
-          FIBO_LOOKBACK: ${{ env.FIBO_LOOKBACK }}
+          FIBO_LOOKBACK:  ${{ env.FIBO_LOOKBACK }}
           SWING_LOOKBACK: ${{ env.SWING_LOOKBACK }}
           PIPS_NEAR_FIBO: ${{ env.PIPS_NEAR_FIBO }}
           PIPS_NEAR_EXT:  ${{ env.PIPS_NEAR_EXT }}
@@ -234,17 +230,14 @@ jobs:
                   swing_low  = float(w["low"].min())
                   r382, r618, ext127, ext161 = fibo_levels(direction, swing_high, swing_low)
 
-                  # FIBO_RETRACE (entry blisko 38.2/61.8)
                   if use["FIBO_RETRACE"]:
                       if (abs(entry-r382)/ps <= PIPS_NEAR_FIBO) or (abs(entry-r618)/ps <= PIPS_NEAR_FIBO):
                           rules_hit.append("FIBO_RETRACE")
 
-                  # FIBO_EXT_TP (TP blisko 1.272/1.618)
                   if use["FIBO_EXT_TP"]:
                       if (abs(tp-ext127)/ps <= PIPS_NEAR_EXT) or (abs(tp-ext161)/ps <= PIPS_NEAR_EXT):
                           rules_hit.append("FIBO_EXT_TP")
 
-                  # SWING_BREAKOUT (entry wybija poprzedni swing)
                   if use["SWING_BREAKOUT"]:
                       w2 = df.iloc[max(0, i_entry - SWING_LOOKBACK) : i_entry]
                       if len(w2) > 0:
@@ -255,10 +248,8 @@ jobs:
               except Exception:
                   pass
 
-              # 1 = sam cross (sygnał bazowy) + 1 za każdy ATOM:
-              rule_score = 1 + len(rules_hit)
+              rule_score = 1 + len(rules_hit)  # 1 = sam cross 20/50
 
-              # zapis do CSV
               rows_out.append([
                   pair,
                   direction,
