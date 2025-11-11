@@ -1,0 +1,64 @@
+{
+  "generated_at": "2025-11-11T21:45:50.450052+00:00",
+  "items": [
+    {
+      "pair": "EURUSD",
+      "status": "setup",
+      "direction": "long",
+      "entry": 1.1522,
+      "sl": 1.15115,
+      "tp": 1.1543,
+      "stop_pips": 11,
+      "risk_pct": 0.01,
+      "risk_usd": 100.0,
+      "atr14": 0.000701,
+      "ema20": 1.150059,
+      "ema50": 1.150017,
+      "ema200": 1.154886,
+      "signal_bar": "2025-11-06 08:00:00+00:00",
+      "entry_mode": "EMA_CROSS"
+    },
+    {
+      "pair": "GBPUSD",
+      "status": "setup",
+      "direction": "long",
+      "entry": 1.30923,
+      "sl": 1.30762,
+      "tp": 1.31245,
+      "stop_pips": 16,
+      "risk_pct": 0.01,
+      "risk_usd": 100.0,
+      "atr14": 0.001074,
+      "ema20": 1.306348,
+      "ema50": 1.306345,
+      "ema200": 1.315153,
+      "signal_bar": "2025-11-06 11:00:00+00:00",
+      "entry_mode": "EMA_CROSS"
+    },
+    {
+      "pair": "USDJPY",
+      "status": "setup",
+      "direction": "long",
+      "entry": 153.93201,
+      "sl": 153.56152,
+      "tp": 154.673,
+      "stop_pips": 37,
+      "risk_pct": 0.01,
+      "risk_usd": 100.0,
+      "atr14": 0.246995,
+      "ema20": 153.488041,
+      "ema50": 153.465925,
+      "ema200": 153.351148,
+      "signal_bar": "2025-11-10 03:00:00+00:00",
+      "entry_mode": "EMA_CROSS"
+    }
+  ],
+  "entry_mode": "EMA_CROSS",
+  "params": {
+    "TREND_MIN_BARS": 3,
+    "SWING_LOOKBACK": 80,
+    "DONCHIAN_N": 20,
+    "ATR_MULT_SL": 1.5,
+    "TP_R_MULT": 2.0
+  }
+}
