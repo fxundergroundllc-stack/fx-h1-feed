@@ -2,8 +2,8 @@ name: update-fx-h1
 
 on:
   schedule:
-    - cron: "5 * * * *"     # co godzinę o :05 UTC
-  workflow_dispatch: {}      # ręczne uruchomienie
+    - cron: "5 * * * *"      # co godzinę o :05 UTC
+  workflow_dispatch: {}       # ręczne uruchomienie
 
 permissions:
   contents: write
@@ -15,37 +15,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    env:
-      OUT_DIR: data
-      PAIRS: EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,BTCUSD
-      TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
-
-      # --- SL/TP (generator bazowy) ---
-      ATR_MULT_SL: "1.5"
-      TP_R_MULT:   "2.0"
-
-      # --- ATOMY: +0.01 lota za każdy spełniony warunek ---
-      USE_RULE_MACD_SIGN: "1"       # DMACD(8,17,9) histogram po stronie kierunku
-      USE_RULE_SIDE_EMA200: "1"     # cena po właściwej stronie EMA200
-      USE_RULE_EMA_STACK: "1"       # EMA20>EMA50>EMA200 (LONG) / odwrotnie (SHORT)
-      USE_RULE_SIDE_VWAP: "1"       # cena po właściwej stronie dziennego VWAP (jeśli dostępny)
-      USE_RULE_NEAR_POC: "1"        # entry blisko POC (jeśli dostępny)
-      USE_RULE_NEAR_EMA20: "0"      # entry blisko EMA20
-      USE_RULE_NEAR_EMA50: "0"      # entry blisko EMA50
-
-      # --- FIBO & SWINGI (też atomy) ---
-      USE_RULE_FIBO_RETRACE: "1"    # entry blisko 38.2% lub 61.8% ostatniego swingu
-      USE_RULE_FIBO_EXT_TP:  "1"    # TP blisko 1.272 lub 1.618 rozszerzenia swingu
-      USE_RULE_SWING_BREAKOUT: "1"  # entry wybija poprzedni swing high/low
-
-      # --- progi / lookbacki ---
-      FIBO_LOOKBACK: "80"
-      SWING_LOOKBACK: "30"
-      PIPS_NEAR_FIBO: "12"
-      PIPS_NEAR_EXT:  "12"
-      PIPS_NEAR_MA: "10"
-      PIPS_NEAR_POC: "10"
 
     steps:
       - name: Checkout
@@ -63,226 +32,108 @@ jobs:
           python -m pip install --upgrade pip
           pip install -U pandas numpy requests
 
-      - name: Fetch H1 OHLC CSVs (Twelve Data)
-        run: python scripts/fetch_fx_h1.py
+      # --- (opcjonalne) Twoje dotychczasowe kroki; nie blokują testu ---
+      - name: Fetch H1 OHLC CSVs (optional)
+        run: |
+          if [ -f scripts/fetch_fx_h1.py ]; then
+            python scripts/fetch_fx_h1.py
+          else
+            echo "scripts/fetch_fx_h1.py not found - skipping"
+          fi
+        continue-on-error: true
 
-      - name: Build setups from CSVs (EMA/ATR)
-        run: python scripts/build_setups.py
+      - name: Build setups from CSVs (optional)
+        run: |
+          if [ -f scripts/build_setups.py ]; then
+            python scripts/build_setups.py
+          else
+            echo "scripts/build_setups.py not found - skipping"
+          fi
+        continue-on-error: true
 
-      - name: Build PRO signals (DMACD, Confluence, VWAP, POC)
-        run: python scripts/build_pro_signals.py
+      - name: Build PRO signals (optional)
+        run: |
+          if [ -f scripts/build_pro_signals.py ]; then
+            python scripts/build_pro_signals.py
+          else
+            echo "scripts/build_pro_signals.py not found - skipping"
+          fi
+        continue-on-error: true
+      # ------------------------------------------------------------------
 
-      # ====== ATOMY: zlicz + dopisz rule_score & rules do mt4.csv ======
-      - name: Make MT4-friendly CSV (atomic rules incl. FIBO & SWINGS, +0.01/each)
-        env:
-          USE_RULE_MACD_SIGN:      ${{ env.USE_RULE_MACD_SIGN }}
-          USE_RULE_SIDE_EMA200:    ${{ env.USE_RULE_SIDE_EMA200 }}
-          USE_RULE_EMA_STACK:      ${{ env.USE_RULE_EMA_STACK }}
-          USE_RULE_SIDE_VWAP:      ${{ env.USE_RULE_SIDE_VWAP }}
-          USE_RULE_NEAR_POC:       ${{ env.USE_RULE_NEAR_POC }}
-          USE_RULE_NEAR_EMA20:     ${{ env.USE_RULE_NEAR_EMA20 }}
-          USE_RULE_NEAR_EMA50:     ${{ env.USE_RULE_NEAR_EMA50 }}
-          USE_RULE_FIBO_RETRACE:   ${{ env.USE_RULE_FIBO_RETRACE }}
-          USE_RULE_FIBO_EXT_TP:    ${{ env.USE_RULE_FIBO_EXT_TP }}
-          USE_RULE_SWING_BREAKOUT: ${{ env.USE_RULE_SWING_BREAKOUT }}
-
-          FIBO_LOOKBACK:  ${{ env.FIBO_LOOKBACK }}
-          SWING_LOOKBACK: ${{ env.SWING_LOOKBACK }}
-          PIPS_NEAR_FIBO: ${{ env.PIPS_NEAR_FIBO }}
-          PIPS_NEAR_EXT:  ${{ env.PIPS_NEAR_EXT }}
-          PIPS_NEAR_MA:   ${{ env.PIPS_NEAR_MA }}
-          PIPS_NEAR_POC:  ${{ env.PIPS_NEAR_POC }}
+      # >>> KLUCZOWY KROK: dopisz testowy SELL EURUSD zgodny ze starym EA <<<
+      - name: Append IMMEDIATE TEST row (EURUSD SELL, SL/TP 10 pips) — legacy EA compatible
         run: |
           python - << 'PY'
-          import os, csv, json, math
-          import pandas as pd
+          import os, csv
+          from datetime import datetime, timezone
+          entry = None
 
-          def pip_size(pair:str)->float:
-              pu = pair.upper()
-              if pu=="BTCUSD": return 1.0
-              if pu=="XAUUSD": return 0.01
-              return 0.01 if pu.endswith("JPY") else 0.0001
+          # Spróbuj wziąć ostatni close z data/EURUSD.csv (jeśli jest),
+          # bo stare EA zwykle używa MARKET z aktualną ceną/entry z CSV.
+          try:
+              import pandas as pd
+              if os.path.exists("data/EURUSD.csv"):
+                  df = pd.read_csv("data/EURUSD.csv")
+                  cols = {c.lower(): c for c in df.columns}
+                  tcol = cols.get("timestamp") or cols.get("time") or cols.get("datetime") or list(df.columns)[0]
+                  ccol = cols.get("close") or "close"
+                  df = df.rename(columns={tcol:"timestamp", ccol:"close"})
+                  entry = float(df.tail(1)["close"].values[0])
+          except Exception as e:
+              print("Data read warning:", e)
 
-          def load_json(path, default):
-              try:
-                  with open(path,'r',encoding='utf-8') as f: return json.load(f)
-              except Exception:
-                  return default
+          if entry is None:
+              entry = 1.00000   # fallback, gdy brak danych
 
-          def load_pair_df(pair):
-              path = os.path.join("data", f"{pair}.csv")
-              df = pd.read_csv(path)
-              cols = {c.lower(): c for c in df.columns}
-              tcol = cols.get("timestamp") or cols.get("time") or cols.get("datetime") or list(df.columns)[0]
-              ocol = cols.get("open") or "open"
-              hcol = cols.get("high") or "high"
-              lcol = cols.get("low")  or "low"
-              ccol = cols.get("close") or "close"
-              df = df.rename(columns={tcol:"timestamp", ocol:"open", hcol:"high", lcol:"low", ccol:"close"})
-              df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-              return df.dropna().sort_values("timestamp").reset_index(drop=True)
+          pip = 0.0001
+          sl  = entry + 10*pip
+          tp  = entry - 10*pip
 
-          latest = load_json('signals/latest.json', {"items":[],"generated_at":""})
-          pro    = load_json('signals/pro.json',    {"items":[]})
-          gen_ts = latest.get("generated_at","")
-          pro_map = { (it.get("pair","").upper()): it for it in pro.get("items", []) }
+          os.makedirs("signals", exist_ok=True)
+          p_csv = "signals/mt4.csv"
 
-          E = os.environ.get
-          use = {
-            "MACD_SIGN":       E("USE_RULE_MACD_SIGN","1")       == "1",
-            "SIDE_EMA200":     E("USE_RULE_SIDE_EMA200","1")     == "1",
-            "EMA_STACK":       E("USE_RULE_EMA_STACK","1")       == "1",
-            "SIDE_VWAP":       E("USE_RULE_SIDE_VWAP","1")       == "1",
-            "NEAR_POC":        E("USE_RULE_NEAR_POC","1")        == "1",
-            "NEAR_EMA20":      E("USE_RULE_NEAR_EMA20","0")      == "1",
-            "NEAR_EMA50":      E("USE_RULE_NEAR_EMA50","0")      == "1",
-            "FIBO_RETRACE":    E("USE_RULE_FIBO_RETRACE","1")    == "1",
-            "FIBO_EXT_TP":     E("USE_RULE_FIBO_EXT_TP","1")     == "1",
-            "SWING_BREAKOUT":  E("USE_RULE_SWING_BREAKOUT","1")  == "1",
+          # Jeżeli plik istnieje, zachowaj jego nagłówek; w przeciwnym razie użyj podstawowego
+          header = []
+          rows   = []
+          if os.path.exists(p_csv):
+              with open(p_csv, encoding="utf-8") as f:
+                  r = list(csv.reader(f))
+              if r:
+                  header = r[0]
+                  rows   = r[1:]
+
+          if not header:
+              header = ['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at']
+
+          # Zbuduj mapę wartości w "starym" formacie (bez dodatkowych kolumn)
+          row_map = {
+              'pair':'EURUSD',
+              'direction':'short',
+              'entry':f"{entry:.5f}",
+              'sl':f"{sl:.5f}",
+              'tp':f"{tp:.5f}",
+              'stop_pips':"10",
+              'lot_size':"0.01",
+              'risk_pct':"",
+              'risk_usd':"",
+              'issued_at':datetime.now(timezone.utc).isoformat()
           }
-          FIBO_LOOKBACK   = int(E("FIBO_LOOKBACK","80"))
-          SWING_LOOKBACK  = int(E("SWING_LOOKBACK","30"))
-          PIPS_NEAR_FIBO  = float(E("PIPS_NEAR_FIBO","12"))
-          PIPS_NEAR_EXT   = float(E("PIPS_NEAR_EXT","12"))
-          PIPS_NEAR_MA    = float(E("PIPS_NEAR_MA","10"))
-          PIPS_NEAR_POC   = float(E("PIPS_NEAR_POC","10"))
 
-          def fibo_levels(direction, high, low):
-              if direction=="long":
-                  top, base = high, low
-                  r382 = top - 0.382*(top-base)
-                  r618 = top - 0.618*(top-base)
-                  ext127 = top + 0.272*(top-base)
-                  ext161 = top + 0.618*(top-base)
-              else:
-                  base, top = high, low
-                  r382 = top + 0.382*(base-top)
-                  r618 = top + 0.618*(base-top)
-                  ext127 = top - 0.272*(base-top)
-                  ext161 = top - 0.618*(base-top)
-              return r382, r618, ext127, ext161
+          # Złóż wiersz zgodnie z aktualnym nagłówkiem (dla nieznanych kolumn -> "")
+          out = [row_map.get(c,"") for c in header]
 
-          rows_out = []
-          for r in latest.get("items", []):
-              if str(r.get("status","")).lower() != "setup":
-                  continue
-
-              pair = str(r.get("pair","")).upper()
-              direction = r.get("direction")
-              entry = float(r.get("entry"))
-              tp    = float(r.get("tp"))
-              ema20 = float(r.get("ema20", entry))
-              ema50 = float(r.get("ema50", entry))
-              ema200= float(r.get("ema200", entry))
-              ps    = pip_size(pair)
-
-              rules_hit = []
-
-              it = pro_map.get(pair, {})
-              # --- MACD ---
-              if use["MACD_SIGN"]:
-                  hist = None
-                  if isinstance(it.get("macd"), dict):
-                      hist = it["macd"].get("hist")
-                  if hist is not None:
-                      ok = (direction=="long" and hist>0) or (direction=="short" and hist<0)
-                      if ok: rules_hit.append("MACD_SIGN")
-              # --- VWAP ---
-              if use["SIDE_VWAP"]:
-                  vwap = it.get("vwap")
-                  if vwap is not None:
-                      ok = (direction=="long" and entry>float(vwap)) or (direction=="short" and entry<float(vwap))
-                      if ok: rules_hit.append("SIDE_VWAP")
-              # --- POC ---
-              if use["NEAR_POC"]:
-                  poc = None
-                  if isinstance(it.get("poc"), dict):
-                      poc = it["poc"].get("price")
-                  if poc is not None and abs(entry-float(poc))/ps <= PIPS_NEAR_POC:
-                      rules_hit.append("NEAR_POC")
-
-              # --- EMA oparte ---
-              if use["SIDE_EMA200"]:
-                  if (direction=="long" and entry>ema200) or (direction=="short" and entry<ema200):
-                      rules_hit.append("SIDE_EMA200")
-              if use["EMA_STACK"]:
-                  if (direction=="long" and (ema20>ema50>ema200)) or (direction=="short" and (ema20<ema50<ema200)):
-                      rules_hit.append("EMA_STACK")
-              if use["NEAR_EMA20"]:
-                  if abs(entry-ema20)/ps <= PIPS_NEAR_MA:
-                      rules_hit.append("NEAR_EMA20")
-              if use["NEAR_EMA50"]:
-                  if abs(entry-ema50)/ps <= PIPS_NEAR_MA:
-                      rules_hit.append("NEAR_EMA50")
-
-              # --- FIBO & SWINGI ---
-              try:
-                  df = load_pair_df(pair)
-                  sig_ts = pd.to_datetime(r.get("signal_bar", None), utc=True, errors="coerce")
-                  if pd.isna(sig_ts):
-                      i_entry = len(df)-1
-                  else:
-                      i_entry = int(df.index[df["timestamp"].searchsorted(sig_ts, side="right")] - 1)
-                      if i_entry < 1: i_entry = len(df)-1
-
-                  w = df.iloc[max(0, i_entry - max(FIBO_LOOKBACK, SWING_LOOKBACK)) : i_entry+1]
-                  swing_high = float(w["high"].max())
-                  swing_low  = float(w["low"].min())
-                  r382, r618, ext127, ext161 = fibo_levels(direction, swing_high, swing_low)
-
-                  if use["FIBO_RETRACE"]:
-                      if (abs(entry-r382)/ps <= PIPS_NEAR_FIBO) or (abs(entry-r618)/ps <= PIPS_NEAR_FIBO):
-                          rules_hit.append("FIBO_RETRACE")
-
-                  if use["FIBO_EXT_TP"]:
-                      if (abs(tp-ext127)/ps <= PIPS_NEAR_EXT) or (abs(tp-ext161)/ps <= PIPS_NEAR_EXT):
-                          rules_hit.append("FIBO_EXT_TP")
-
-                  if use["SWING_BREAKOUT"]:
-                      w2 = df.iloc[max(0, i_entry - SWING_LOOKBACK) : i_entry]
-                      if len(w2) > 0:
-                          prev_high = float(w2["high"].max())
-                          prev_low  = float(w2["low"].min())
-                          if (direction=="long" and entry>prev_high) or (direction=="short" and entry<prev_low):
-                              rules_hit.append("SWING_BREAKOUT")
-              except Exception:
-                  pass
-
-              rule_score = 1 + len(rules_hit)  # 1 = sam cross 20/50
-
-              rows_out.append([
-                  pair,
-                  direction,
-                  r.get("entry",""),
-                  r.get("sl",""),
-                  r.get("tp",""),
-                  r.get("stop_pips",""),
-                  r.get("lot_size",""),
-                  int(round((r.get("risk_pct") or 0.0)*100)),
-                  r.get("risk_usd",""),
-                  gen_ts,
-                  rule_score,
-                  ";".join(rules_hit)
-              ])
-
-          os.makedirs('signals', exist_ok=True)
-          with open('signals/mt4.csv','w',newline='',encoding='utf-8') as f:
+          with open(p_csv, 'w', newline='', encoding='utf-8') as f:
               w = csv.writer(f)
-              w.writerow(['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at','rule_score','rules'])
-              w.writerows(rows_out)
+              w.writerow(header)
+              w.writerows(rows)
+              w.writerow(out)
 
-          print(f"[MT4 CSV] rows={len(rows_out)}; rule_score=1+atoms; rules=[lista atomów]")
+          print("Appended legacy TEST row: EURUSD, short, 0.01 lot, SL/TP=10 pips")
           PY
-      # ================================================================
 
-      - name: Commit & push CSVs + signals
+      - name: Commit & push generated files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update: FX H1 + atomic rules → mt4.csv (rule_score & rules)"
-          file_pattern: |
-            data/*.csv
-            signals/latest.*
-            signals/mt4.csv
-            signals/pro.json
-            signals/levels_*.csv
-            signals/poc_*.csv
+          commit_message: "Update: append LEGACY TEST EURUSD short 0.01 SL/TP 10 pips"
+          # commitujemy wszystko, żeby nie zgubić mt4.csv
