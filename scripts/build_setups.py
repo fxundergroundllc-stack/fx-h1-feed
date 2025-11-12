@@ -1,224 +1,215 @@
-import os, json, math
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Generator sygnałów H1:
+- Sygnał bazowy = ostatnie przecięcie EMA20/EMA50 (potwierdzone bar po przecięciu)
+- Atomy (nie blokują, tylko zwiększają rule_score):
+  A1 MACD(8,17,9) histogram po stronie kierunku
+  A2 Close po właściwej stronie EMA200
+  A3 Stack: EMA20>EMA50>EMA200 (long) lub odwrotnie (short)
+  A4 Blisko EMA20 (<= near_pips)
+  A5 Blisko EMA50 (<= near_pips)
+  A6 Blisko Fibo 38.2%/61.8% ostatniego swingu (lookback)
+  A7 Wybicie swingu (close > swingHigh lub close < swingLow)
+- SL/TP: SL = 1.5*ATR14, TP = 2R (R = |entry-SL|)
+Zapis:
+  signals/mt4.csv  (pierwsze 10 kolumn kompatybilne ze starym EA)
+  signals/latest.json
+  signals/debug_report.txt
+"""
+import os, json
 from datetime import datetime, timezone
-try:
-    from zoneinfo import ZoneInfo
-    ZONE = ZoneInfo("Europe/Warsaw")
-except Exception:
-    ZONE = timezone.utc
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+# ======= KONFIG =======
+PAIRS = ["EURUSD","GBPUSD","AUDUSD","NZDUSD","USDJPY","USDCHF","USDCAD","XAUUSD"]
 DATA_DIR = "data"
-OUT_DIR = "signals"
+OUT_DIR  = "signals"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- parametry z ENV ---
-ENTRY_MODE       = os.getenv("ENTRY_MODE", "EMA_CROSS").upper()
-TREND_MIN_BARS   = int(os.getenv("TREND_MIN_BARS", "3"))
-SWING_LOOKBACK   = int(os.getenv("SWING_LOOKBACK", "80"))
-DONCHIAN_N       = int(os.getenv("DONCHIAN_N", "20"))
-ATR_MIN_MULT     = float(os.getenv("ATR_MIN_MULT", "0.8"))
+ATR_PERIOD      = 14
+ATR_SL_MULT     = 1.5
+TP_R_MULT       = 2.0
+SWING_LOOKBACK  = 30
+FIBO_LOOKBACK   = 80
+NEAR_PIPS       = 10.0
+# ======================
 
-ATR_MULT_SL      = float(os.getenv("ATR_MULT_SL", "1.5"))
-TP_R_MULT        = float(os.getenv("TP_R_MULT", "2.0"))
-
-PAIRS            = [p.strip().upper() for p in os.getenv("PAIRS","EURUSD,GBPUSD,USDJPY").split(",")]
-
-CAPITAL          = float(os.getenv("CAPITAL", "10000"))   # opcjonalnie do risk_usd (info)
-RISK_PCT         = float(os.getenv("RISK_PCT", "0.01"))   # 1% = 0.01
-
-# --- utils ---
 def pip_size(pair: str) -> float:
-    if pair == "BTCUSD": return 1.0
-    if pair == "XAUUSD": return 0.01
-    return 0.01 if pair.endswith("JPY") else 0.0001
+    pair = pair.upper()
+    if pair.endswith("JPY"): return 0.01
+    if pair == "XAUUSD":     return 0.10
+    return 0.0001
 
-def load_pair_df(pair: str) -> pd.DataFrame:
-    path = os.path.join(DATA_DIR, f"{pair}.csv")
-    df = pd.read_csv(path)
-    # elastyczne nazwy kolumn
+def load_df(pair: str) -> pd.DataFrame:
+    p = os.path.join(DATA_DIR, f"{pair}.csv")
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Missing {p}")
+    df = pd.read_csv(p)
     cols = {c.lower(): c for c in df.columns}
     tcol = cols.get("timestamp") or cols.get("time") or cols.get("datetime") or list(df.columns)[0]
-    ocol = cols.get("open") or "open"
-    hcol = cols.get("high") or "high"
-    lcol = cols.get("low")  or "low"
-    ccol = cols.get("close") or "close"
+    ocol = cols.get("open","open"); hcol = cols.get("high","high"); lcol = cols.get("low","low"); ccol = cols.get("close","close")
     df = df.rename(columns={tcol:"timestamp", ocol:"open", hcol:"high", lcol:"low", ccol:"close"})
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp","open","high","low","close"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
 
-def indicators(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d["ema20"]  = ema(d["close"], 20)
-    d["ema50"]  = ema(d["close"], 50)
-    d["ema200"] = ema(d["close"], 200)
-    # Wilder ATR(14)
-    tr1 = d["high"] - d["low"]
-    tr2 = (d["high"] - d["close"].shift(1)).abs()
-    tr3 = (d["low"]  - d["close"].shift(1)).abs()
-    d["tr"] = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
-    d["atr14"] = d["tr"].rolling(14, min_periods=1).mean()
-    # DMACD (8,17,9)
-    fast, slow, sig = 8,17,9
-    macd = ema(d["close"], fast) - ema(d["close"], slow)
-    d["macd_hist"] = macd - ema(macd, sig)
-    # Donchian
-    d["don_hi"] = d["high"].rolling(DONCHIAN_N, min_periods=1).max()
-    d["don_lo"] = d["low"].rolling(DONCHIAN_N, min_periods=1).min()
-    return d
+def atr(df: pd.DataFrame, n=14) -> np.ndarray:
+    c,h,l = df["close"].values, df["high"].values, df["low"].values
+    prev_c = np.roll(c,1); prev_c[0]=c[0]
+    tr = np.maximum(h-l, np.maximum(np.abs(h-prev_c), np.abs(l-prev_c)))
+    return pd.Series(tr).rolling(n, min_periods=n).mean().values
 
-def last_swing(d: pd.DataFrame, lookback: int):
-    w = d.iloc[-lookback:].copy()
-    return float(w["high"].max()), float(w["low"].min())
+def macd_hist(series: pd.Series, fast=8, slow=17, sig=9) -> pd.Series:
+    ema_f = series.ewm(span=fast, adjust=False).mean()
+    ema_s = series.ewm(span=slow, adjust=False).mean()
+    macd  = ema_f - ema_s
+    signal= macd.ewm(span=sig, adjust=False).mean()
+    return macd - signal
 
-def in_trend_long(d, i=None):
-    if i is None: i = len(d)-1
-    sl = slice(max(0, i-TREND_MIN_BARS+1), i+1)
-    return (d["close"].iloc[sl] > d["ema200"].iloc[sl]).all()
+def window_swing(df: pd.DataFrame, lookback: int, shift: int):
+    lo = df["low"].iloc[max(0, shift+1): shift+1+lookback].min()
+    hi = df["high"].iloc[max(0, shift+1): shift+1+lookback].max()
+    if np.isnan(lo): lo = df["low"].min()
+    if np.isnan(hi): hi = df["high"].max()
+    return float(hi), float(lo)
 
-def in_trend_short(d, i=None):
-    if i is None: i = len(d)-1
-    sl = slice(max(0, i-TREND_MIN_BARS+1), i+1)
-    return (d["close"].iloc[sl] < d["ema200"].iloc[sl]).all()
+def fibo_levels(df: pd.DataFrame, lookback: int, shift: int, dir_long: bool):
+    hi, lo = window_swing(df, lookback, shift)
+    if dir_long:   # ruch w górę
+        r382 = hi - 0.382*(hi-lo); r618 = hi - 0.618*(hi-lo)
+    else:          # ruch w dół
+        r382 = lo + 0.382*(hi-lo); r618 = lo + 0.618*(hi-lo)
+    return r382, r618
 
-# --- logika wejść ---
-def signal_ema_cross(d: pd.DataFrame):
-    diff = d["ema20"] - d["ema50"]
-    sign = np.sign(diff.fillna(0.0).values)
-    idx = np.where(np.diff(sign) != 0)[0]
+def last_cross_signal(df: pd.DataFrame, pair: str):
+    # EMA
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["ema200"]= ema(df["close"], 200)
+    # MACD hist
+    df["macd_hist"] = macd_hist(df["close"], 8,17,9)
+    # ATR
+    df["atr"] = atr(df, ATR_PERIOD)
+
+    diff = (df["ema20"] - df["ema50"]).to_numpy()
+    sign = np.sign(np.nan_to_num(diff))
+    idx  = np.where(np.diff(sign)!=0)[0]
     if len(idx)==0: return None
-    i = int(idx[-1]+1)  # świeca po przecięciu
-    if i >= len(d): i = len(d)-1
-    if d["ema20"].iloc[i] > d["ema50"].iloc[i] and d["close"].iloc[i] > d["ema20"].iloc[i]:
-        return ("long", i)
-    if d["ema20"].iloc[i] < d["ema50"].iloc[i] and d["close"].iloc[i] < d["ema20"].iloc[i]:
-        return ("short", i)
-    return None
 
-def signal_ema_cross_trend_macd(d: pd.DataFrame):
-    out = signal_ema_cross(d)
-    if not out: return None
-    side, i = out
-    if side=="long":
-        if not in_trend_long(d, i): return None
-        if d["macd_hist"].iloc[i] <= 0: return None
+    i_cross = int(idx[-1])                  # bar z przecięciem
+    i_sig   = min(i_cross+1, len(df)-1)     # bar po przecięciu (zamknięty)
+    row     = df.iloc[i_sig]
+    dir_long= bool(row.ema20 > row.ema50)
+    side    = "long" if dir_long else "short"
+    entry   = float(row.close)
+    ps      = pip_size(pair)
+
+    # SL/TP na bazie ATR
+    a = float(row.atr)
+    if not np.isfinite(a) or a<=0: return None
+    if dir_long:
+        sl = entry - ATR_SL_MULT*a
+        tp = entry + TP_R_MULT*abs(entry-sl)
     else:
-        if not in_trend_short(d, i): return None
-        if d["macd_hist"].iloc[i] >= 0: return None
-    return (side, i)
+        sl = entry + ATR_SL_MULT*a
+        tp = entry - TP_R_MULT*abs(entry-sl)
+    stop_pips = int(round(abs(entry-sl)/ps))
 
-def signal_pullback_fibo(d: pd.DataFrame):
-    i = len(d)-1
-    # trend
-    if (d["ema20"].iloc[i] > d["ema50"].iloc[i] > d["ema200"].iloc[i]).all() if hasattr(d["ema20"].iloc[i],"all") else (d["ema20"].iloc[i] > d["ema50"].iloc[i] > d["ema200"].iloc[i]):
-        side="long"
-    elif (d["ema20"].iloc[i] < d["ema50"].iloc[i] < d["ema200"].iloc[i]).all() if hasattr(d["ema20"].iloc[i],"all") else (d["ema20"].iloc[i] < d["ema50"].iloc[i] < d["ema200"].iloc[i]):
-        side="short"
-    else:
-        return None
-    hi, lo = last_swing(d, SWING_LOOKBACK)
-    if side=="long":
-        top, base = hi, lo
-        r382 = top - 0.382*(top-base)
-        r618 = top - 0.618*(top-base)
-        in_zone = r618 <= d["close"].iloc[i] <= r382
-        momentum_ok = d["macd_hist"].iloc[i] > 0
-    else:
-        base, top = hi, lo  # tu "hi" > "lo"
-        r382 = top + 0.382*(base-top)
-        r618 = top + 0.618*(base-top)
-        in_zone = r382 <= d["close"].iloc[i] <= r618
-        momentum_ok = d["macd_hist"].iloc[i] < 0
-    if in_zone and momentum_ok:
-        return (side, i)
-    return None
+    # ===== Atomy (boolean) =====
+    atoms = {}
+    # A1: MACD histogram po stronie kierunku
+    atoms["A1_MACD_SIGN"] = (row.macd_hist>0) if dir_long else (row.macd_hist<0)
+    # A2: strona EMA200
+    atoms["A2_SIDE_EMA200"] = (entry>row.ema200) if dir_long else (entry<row.ema200)
+    # A3: stack
+    atoms["A3_EMA_STACK"] = (row.ema20>row.ema50>row.ema200) if dir_long else (row.ema20<row.ema50<row.ema200)
+    # A4/A5: blisko EMA20/EMA50
+    atoms["A4_NEAR_EMA20"] = (abs(entry-row.ema20)/ps <= NEAR_PIPS)
+    atoms["A5_NEAR_EMA50"] = (abs(entry-row.ema50)/ps <= NEAR_PIPS)
+    # A6: blisko Fibo 38.2/61.8
+    r382, r618 = fibo_levels(df, FIBO_LOOKBACK, i_sig, dir_long)
+    atoms["A6_NEAR_FIBO"] = (abs(entry-r382)/ps<=NEAR_PIPS) or (abs(entry-r618)/ps<=NEAR_PIPS)
+    # A7: wybicie swingu z okna
+    swing_hi, swing_lo = window_swing(df, SWING_LOOKBACK, i_sig)
+    atoms["A7_SWING_BREAK"] = (entry>swing_hi) if dir_long else (entry<swing_lo)
 
-def signal_donchian_breakout(d: pd.DataFrame):
-    i = len(d)-1
-    # atr filter: zmienność powyżej mediany*N
-    atr = d["atr14"].iloc[-DONCHIAN_N:]
-    if len(atr) < 5: return None
-    if d["atr14"].iloc[i] < ATR_MIN_MULT * float(np.median(atr.values)): return None
-    # wybicie
-    hi = float(d["don_hi"].iloc[i-1])  # poprzednie N
-    lo = float(d["don_lo"].iloc[i-1])
-    c = float(d["close"].iloc[i])
-    if c > hi: return ("long", i)
-    if c < lo: return ("short", i)
-    return None
+    # score = 1 (cross) + sum(atoms)
+    rule_score = 1 + sum(1 for v in atoms.values() if v)
+    rules_text = "CROSS " + " ".join([k for k,v in atoms.items() if v])
 
-def choose_signal(d: pd.DataFrame):
-    mode = ENTRY_MODE
-    if mode == "EMA_CROSS":                  return signal_ema_cross(d)
-    if mode == "EMA_CROSS_TREND_MACD":       return signal_ema_cross_trend_macd(d)
-    if mode == "PULLBACK_FIBO":              return signal_pullback_fibo(d)
-    if mode == "DONCHIAN_BREAKOUT":          return signal_donchian_breakout(d)
-    # fallback
-    return signal_ema_cross(d)
-
-def build_item(pair: str, d: pd.DataFrame):
-    sig = choose_signal(d)
-    if not sig: return None
-    side, i = sig
-    entry = float(d["close"].iloc[i])
-    atr   = float(d["atr14"].iloc[i])
-    if atr <= 0: return None
-    if side=="long":
-        sl = entry - ATR_MULT_SL*atr
-        tp = entry + TP_R_MULT*(entry - sl)
-    else:
-        sl = entry + ATR_MULT_SL*atr
-        tp = entry - TP_R_MULT*(sl - entry)
-    ps = pip_size(pair)
-    stop_pips = abs(entry - sl)/ps
     return {
         "pair": pair,
-        "status": "setup",
         "direction": side,
         "entry": round(entry, 5),
-        "sl": round(sl, 5),
-        "tp": round(tp, 5),
-        "stop_pips": int(round(stop_pips)),
-        "risk_pct": RISK_PCT,
-        "risk_usd": round(CAPITAL * RISK_PCT, 2),
-        "atr14": round(atr, 6),
-        "ema20": round(float(d["ema20"].iloc[i]), 6),
-        "ema50": round(float(d["ema50"].iloc[i]), 6),
-        "ema200": round(float(d["ema200"].iloc[i]), 6),
-        "signal_bar": str(d["timestamp"].iloc[i]),
-        "entry_mode": ENTRY_MODE
+        "sl":    round(sl, 5),
+        "tp":    round(tp, 5),
+        "stop_pips": int(stop_pips),
+        "lot_size": 0.01,      # EA może liczyć własny lot na bazie rule_score
+        "risk_pct": "",
+        "risk_usd": "",
+        "issued_at": row.timestamp.isoformat(),
+        "rule_score": int(rule_score),
+        "rules": rules_text
+    }, {
+        "i_cross": int(i_cross),
+        "i_signal": int(i_sig),
+        "time_signal": row.timestamp.isoformat(),
+        "ema20": float(row.ema20),
+        "ema50": float(row.ema50),
+        "ema200": float(row.ema200),
+        "macd_hist": float(row.macd_hist),
+        "atr": float(a),
+        "swing_high": float(swing_hi),
+        "swing_low": float(swing_lo),
+        "r382": float(r382),
+        "r618": float(r618),
+        "atoms": atoms
     }
 
 def main():
     items = []
+    debug_lines = []
     for pair in PAIRS:
         try:
-            df = load_pair_df(pair)
-            df = indicators(df)
-            item = build_item(pair, df)
-            if item: items.append(item)
+            df = load_df(pair)
+            out = last_cross_signal(df, pair)
+            if out is None:
+                debug_lines.append(f"[{pair}] no-cross or insufficient ATR/data")
+                continue
+            sig, dbg = out
+            items.append(sig)
+            hits = sum(1 for v in dbg["atoms"].values() if v)
+            debug_lines.append(
+                f"[{pair}] {sig['direction']} time={dbg['time_signal']} "
+                f"entry={sig['entry']:.5f} SL={sig['sl']:.5f} TP={sig['tp']:.5f} "
+                f"score={sig['rule_score']} atoms={hits} -> {sig['rules']}"
+            )
         except Exception as e:
-            print(f"[{pair}] ERROR: {e}")
+            debug_lines.append(f"[{pair}] ERROR: {e}")
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "items": items,
-        "entry_mode": ENTRY_MODE,
-        "params": {
-            "TREND_MIN_BARS": TREND_MIN_BARS,
-            "SWING_LOOKBACK": SWING_LOOKBACK,
-            "DONCHIAN_N": DONCHIAN_N,
-            "ATR_MULT_SL": ATR_MULT_SL,
-            "TP_R_MULT": TP_R_MULT
-        }
-    }
+    # CSV dla EA (legacy + dodatkowe kolumny na końcu)
+    csv_path = os.path.join(OUT_DIR, "mt4.csv")
+    hdr = ['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at','rule_score','rules']
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(hdr) + "\n")
+        for r in items:
+            f.write(",".join(str(r.get(k,"")) for k in hdr) + "\n")
+
+    # JSON meta
+    meta = {"generated_at": datetime.now(timezone.utc).isoformat(), "items": items}
     with open(os.path.join(OUT_DIR, "latest.json"), "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"latest.json written with {len(items)} item(s), ENTRY_MODE={ENTRY_MODE}")
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # Raport tekstowy
+    with open(os.path.join(OUT_DIR, "debug_report.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(debug_lines) + "\n")
+
+    print(f"OK: generated {len(items)} signals → {csv_path}")
+    print("\n".join(debug_lines))
 
 if __name__ == "__main__":
     main()
