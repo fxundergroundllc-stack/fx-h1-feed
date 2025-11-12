@@ -32,45 +32,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -U pandas numpy requests
 
-      # --- (opcjonalne) Twoje dotychczasowe kroki; nie blokują testu ---
+      # (Opcjonalnie) pobierz H1 z Twelve Data – działa, jeśli dodasz secret TWELVE_DATA_KEY
       - name: Fetch H1 OHLC CSVs (optional)
+        env:
+          TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
         run: |
           if [ -f scripts/fetch_fx_h1.py ]; then
-            python scripts/fetch_fx_h1.py
+            python scripts/fetch_fx_h1.py || echo "fetch_fx_h1.py failed (missing key?) — continuing"
           else
             echo "scripts/fetch_fx_h1.py not found - skipping"
           fi
-        continue-on-error: true
 
-      - name: Build setups from CSVs (optional)
-        run: |
-          if [ -f scripts/build_setups.py ]; then
-            python scripts/build_setups.py
-          else
-            echo "scripts/build_setups.py not found - skipping"
-          fi
-        continue-on-error: true
+      # Generator sygnałów: EMA20/50 + atomy -> signals/mt4.csv + latest.json + debug_report.txt
+      - name: Build setups from CSVs
+        run: python scripts/build_setups.py
 
-      - name: Build PRO signals (optional)
+      # (Opcjonalnie) dopisz testowy SELL EURUSD co run – możesz wyłączyć na końcu (APPEND_TEST=false)
+      - name: Append LEGACY TEST row (EURUSD SELL, SL/TP 10 pips)
+        env:
+          APPEND_TEST: "true"
         run: |
-          if [ -f scripts/build_pro_signals.py ]; then
-            python scripts/build_pro_signals.py
-          else
-            echo "scripts/build_pro_signals.py not found - skipping"
-          fi
-        continue-on-error: true
-      # ------------------------------------------------------------------
-
-      # >>> KLUCZOWY KROK: dopisz testowy SELL EURUSD zgodny ze starym EA <<<
-      - name: Append IMMEDIATE TEST row (EURUSD SELL, SL/TP 10 pips) — legacy EA compatible
-        run: |
+          if [ "${APPEND_TEST}" != "true" ]; then
+            echo "Skipping test row (APPEND_TEST != true)"; exit 0; fi
           python - << 'PY'
           import os, csv
           from datetime import datetime, timezone
           entry = None
-
-          # Spróbuj wziąć ostatni close z data/EURUSD.csv (jeśli jest),
-          # bo stare EA zwykle używa MARKET z aktualną ceną/entry z CSV.
           try:
               import pandas as pd
               if os.path.exists("data/EURUSD.csv"):
@@ -82,58 +69,31 @@ jobs:
                   entry = float(df.tail(1)["close"].values[0])
           except Exception as e:
               print("Data read warning:", e)
-
-          if entry is None:
-              entry = 1.00000   # fallback, gdy brak danych
-
+          if entry is None: entry = 1.00000
           pip = 0.0001
           sl  = entry + 10*pip
           tp  = entry - 10*pip
-
           os.makedirs("signals", exist_ok=True)
           p_csv = "signals/mt4.csv"
-
-          # Jeżeli plik istnieje, zachowaj jego nagłówek; w przeciwnym razie użyj podstawowego
           header = []
           rows   = []
           if os.path.exists(p_csv):
+              import csv as _csv
               with open(p_csv, encoding="utf-8") as f:
-                  r = list(csv.reader(f))
-              if r:
-                  header = r[0]
-                  rows   = r[1:]
-
+                  r = list(_csv.reader(f))
+              if r: header, rows = r[0], r[1:]
           if not header:
               header = ['pair','direction','entry','sl','tp','stop_pips','lot_size','risk_pct','risk_usd','issued_at']
-
-          # Zbuduj mapę wartości w "starym" formacie (bez dodatkowych kolumn)
-          row_map = {
-              'pair':'EURUSD',
-              'direction':'short',
-              'entry':f"{entry:.5f}",
-              'sl':f"{sl:.5f}",
-              'tp':f"{tp:.5f}",
-              'stop_pips':"10",
-              'lot_size':"0.01",
-              'risk_pct':"",
-              'risk_usd':"",
-              'issued_at':datetime.now(timezone.utc).isoformat()
-          }
-
-          # Złóż wiersz zgodnie z aktualnym nagłówkiem (dla nieznanych kolumn -> "")
+          row_map = {'pair':'EURUSD','direction':'short','entry':f"{entry:.5f}",
+                     'sl':f"{sl:.5f}",'tp':f"{tp:.5f}",'stop_pips':"10",'lot_size':"0.01",
+                     'risk_pct':"",'risk_usd':"",'issued_at':datetime.now(timezone.utc).isoformat()}
           out = [row_map.get(c,"") for c in header]
-
           with open(p_csv, 'w', newline='', encoding='utf-8') as f:
-              w = csv.writer(f)
-              w.writerow(header)
-              w.writerows(rows)
-              w.writerow(out)
-
+              w = csv.writer(f); w.writerow(header); w.writerows(rows); w.writerow(out)
           print("Appended legacy TEST row: EURUSD, short, 0.01 lot, SL/TP=10 pips")
           PY
 
       - name: Commit & push generated files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update: append LEGACY TEST EURUSD short 0.01 SL/TP 10 pips"
-          # commitujemy wszystko, żeby nie zgubić mt4.csv
+          commit_message: "Update: EMA cross signals + debug + (optional) test row"
