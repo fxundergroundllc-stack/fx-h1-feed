@@ -2,8 +2,8 @@ name: update-fx-h1
 
 on:
   schedule:
-    - cron: "5 * * * *"      # co godzinę o :05 UTC
-  workflow_dispatch: {}       # ręczne uruchomienie
+    - cron: "0 * * * *"      # Równo o :00 UTC po zamknięciu świecy H1
+  workflow_dispatch: {}       # Ręczne uruchomienie
 
 permissions:
   contents: write
@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -U pandas numpy requests
 
-      # (Opcjonalnie) pobierz H1 z Twelve Data – działa, jeśli dodasz secret TWELVE_DATA_KEY
+      # (Opcjonalnie) pobierz dane H1 z Twelve Data, jeśli masz secret
       - name: Fetch H1 OHLC CSVs (optional)
         env:
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
@@ -43,17 +43,20 @@ jobs:
             echo "scripts/fetch_fx_h1.py not found - skipping"
           fi
 
-      # Generator sygnałów: EMA20/50 + atomy -> signals/mt4.csv + latest.json + debug_report.txt
+      # Generator sygnałów – tylko NA CZASIE, bez „spóźnionych”
       - name: Build setups from CSVs
+        env:
+          EMIT_PAST_CROSS: "false"     # ustaw "true", jeśli chcesz jednorazowo nadrobić stare crossy
+          FRESH_MAX_HOURS: "2"         # dane muszą być świeższe niż X godzin
         run: python scripts/build_setups.py
 
-      # (Opcjonalnie) dopisz testowy SELL EURUSD co run – możesz wyłączyć na końcu (APPEND_TEST=false)
+      # TEST EURUSD – zostaw "true" dopóki testujesz, potem zmień na "false"
       - name: Append LEGACY TEST row (EURUSD SELL, SL/TP 10 pips)
         env:
           APPEND_TEST: "true"
         run: |
           if [ "${APPEND_TEST}" != "true" ]; then
-            echo "Skipping test row (APPEND_TEST != true)"; exit 0; fi
+            echo "Skipping test row"; exit 0; fi
           python - << 'PY'
           import os, csv
           from datetime import datetime, timezone
@@ -70,13 +73,10 @@ jobs:
           except Exception as e:
               print("Data read warning:", e)
           if entry is None: entry = 1.00000
-          pip = 0.0001
-          sl  = entry + 10*pip
-          tp  = entry - 10*pip
+          pip = 0.0001; sl = entry + 10*pip; tp = entry - 10*pip
           os.makedirs("signals", exist_ok=True)
           p_csv = "signals/mt4.csv"
-          header = []
-          rows   = []
+          header, rows = [], []
           if os.path.exists(p_csv):
               import csv as _csv
               with open(p_csv, encoding="utf-8") as f:
@@ -88,12 +88,12 @@ jobs:
                      'sl':f"{sl:.5f}",'tp':f"{tp:.5f}",'stop_pips':"10",'lot_size':"0.01",
                      'risk_pct':"",'risk_usd':"",'issued_at':datetime.now(timezone.utc).isoformat()}
           out = [row_map.get(c,"") for c in header]
-          with open(p_csv, 'w', newline='', encoding='utf-8') as f:
-              w = csv.writer(f); w.writerow(header); w.writerows(rows); w.writerow(out)
-          print("Appended legacy TEST row: EURUSD, short, 0.01 lot, SL/TP=10 pips")
+          with open(p_csv,'w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f); w.writerow(header); w.writerows(rows); w.writerow(out)
+          print("Appended legacy TEST row")
           PY
 
       - name: Commit & push generated files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update: EMA cross signals + debug + (optional) test row"
+          commit_message: "Update: on-time EMA cross signals + debug (+ optional test)"
